@@ -5,8 +5,10 @@
  * 底层依赖 Python fonttools（首次运行时会尝试自动安装）。
  *
  * 用法:
- *   npx tsx compress-font.ts <字体文件>          # 完整简/繁体中文模式
- *   npx tsx compress-font.ts <字体文件> --gb2312  # 仅 GB2312 字符范围（简体为主）
+ *   npx tsx compress-font.ts <字体文件>                    # 完整简/繁体中文模式
+ *   npx tsx compress-font.ts <字体文件> --gb2312            # 仅 GB2312 字符范围（简体为主）
+ *   npx tsx compress-font.ts <字体文件> --nomarks           # 剔除标点符号
+ *   npx tsx compress-font.ts <字体文件> --gb2312 --nomarks  # GB2312 + 剔除标点符号
  */
 
 import { execFileSync, execSync } from "child_process";
@@ -45,6 +47,25 @@ const RANGES_FULL: UnicodeDisplayRange[] = [
   ["U+FF00-FFEF", "全角/半角形式"],
 ];
 
+const RANGES_FULL_NOMARKS: UnicodeDisplayRange[] = [
+  ["U+0020", "空格"],
+  ["U+0030-0039", "ASCII 数字"],
+  ["U+0041-005A", "ASCII 大写字母"],
+  ["U+0061-007A", "ASCII 小写字母"],
+  ["U+00C0-00D6", "Latin-1 字母"],
+  ["U+00D8-00F6", "Latin-1 字母"],
+  ["U+00F8-00FF", "Latin-1 字母"],
+  ["U+2E80-2EFF", "CJK 部首补充"],
+  ["U+2F00-2FDF", "康熙部首"],
+  ["U+3100-312F", "注音符号（繁体拼音）"],
+  ["U+31A0-31BF", "注音符号扩展"],
+  ["U+4E00-9FFF", "CJK 统一汉字主区（简/繁体均覆盖）"],
+  ["U+F900-FAFF", "CJK 兼容汉字"],
+  ["U+FF10-FF19", "全角数字"],
+  ["U+FF21-FF3A", "全角大写字母"],
+  ["U+FF41-FF5A", "全角小写字母"],
+];
+
 /**
  * GB2312 精简模式：GB2312 主范围内的 CJK 字符，
  * 不含部分扩展繁体字及现代新字。
@@ -56,6 +77,19 @@ const RANGES_GB2312_BASE: UnicodeDisplayRange[] = [
   ["U+3000-303F", "CJK 符号和标点"],
   ["U+FE30-FE4F", "CJK 兼容形式"],
   ["U+FF00-FFEF", "全角/半角形式"],
+];
+
+const RANGES_GB2312_NOMARKS_BASE: UnicodeDisplayRange[] = [
+  ["U+0020", "空格"],
+  ["U+0030-0039", "ASCII 数字"],
+  ["U+0041-005A", "ASCII 大写字母"],
+  ["U+0061-007A", "ASCII 小写字母"],
+  ["U+00C0-00D6", "Latin-1 字母"],
+  ["U+00D8-00F6", "Latin-1 字母"],
+  ["U+00F8-00FF", "Latin-1 字母"],
+  ["U+FF10-FF19", "全角数字"],
+  ["U+FF21-FF3A", "全角大写字母"],
+  ["U+FF41-FF5A", "全角小写字母"],
 ];
 
 let gb2312HanziSpecsCache: string[] | null = null;
@@ -137,23 +171,31 @@ function getGb2312HanziSpecs(): string[] {
   return specs;
 }
 
-function getUnicodeSubset(gb2312Mode: boolean): UnicodeSubset {
+export function getUnicodeSubset(
+  gb2312Mode: boolean,
+  noMarksMode: boolean,
+): UnicodeSubset {
   if (!gb2312Mode) {
+    const ranges = noMarksMode ? RANGES_FULL_NOMARKS : RANGES_FULL;
+
     return {
-      unicodes: RANGES_FULL.map(([range]) => range),
-      displayRanges: RANGES_FULL,
+      unicodes: ranges.map(([range]) => range),
+      displayRanges: ranges,
     };
   }
 
   const gb2312HanziSpecs = getGb2312HanziSpecs();
+  const baseRanges = noMarksMode
+    ? RANGES_GB2312_NOMARKS_BASE
+    : RANGES_GB2312_BASE;
 
   return {
     unicodes: [
-      ...RANGES_GB2312_BASE.map(([range]) => range),
+      ...baseRanges.map(([range]) => range),
       ...gb2312HanziSpecs,
     ],
     displayRanges: [
-      ...RANGES_GB2312_BASE,
+      ...baseRanges,
       [
         "GB2312 汉字表",
         `真实双字节码表生成（6763 字，${gb2312HanziSpecs.length} 段）`,
@@ -252,12 +294,14 @@ function writeCss(
 function main(): void {
   const argv = process.argv.slice(2);
   const gb2312Mode = argv.includes("--gb2312");
+  const noMarksMode = argv.includes("--nomarks");
   const inputFile = argv.find((a) => !a.startsWith("--"));
 
   if (!inputFile) {
     console.error(
-      "用法: npx tsx compress-font.ts <字体文件.otf> [--gb2312]\n" +
-        "  --gb2312   使用 GB2312 字符范围（简体为主，不含部分扩展繁体字）",
+      "用法: npx tsx compress-font.ts <字体文件.otf> [--gb2312] [--nomarks]\n" +
+        "  --gb2312   使用 GB2312 字符范围（简体为主，不含部分扩展繁体字）\n" +
+        "  --nomarks  剔除标点符号",
     );
     process.exit(1);
   }
@@ -275,17 +319,20 @@ function main(): void {
   // 输出到脚本运行目录下的 font/ 文件夹
   const dir = path.resolve("font");
   mkdirSync(dir, { recursive: true });
-  const suffix = gb2312Mode ? "-gb2312-subset" : "-subset";
+  const suffix = `${gb2312Mode ? "-gb2312" : ""}${
+    noMarksMode ? "-nomarks" : ""
+  }-subset`;
   const outputPath = path.join(dir, `${base}${suffix}.woff2`);
 
   const originalSize = statSync(inputPath).size;
-  const subset = getUnicodeSubset(gb2312Mode);
+  const subset = getUnicodeSubset(gb2312Mode, noMarksMode);
 
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`输入文件 : ${path.basename(inputPath)}  (${fmt(originalSize)})`);
   console.log(
     `压缩模式 : ${gb2312Mode ? "GB2312 精简（简体为主）" : "完整简/繁体中文"}`,
   );
+  console.log(`剔除标点 : ${noMarksMode ? "是" : "否"}`);
   console.log("Unicode 区间:");
   subset.displayRanges.forEach(([range, desc]) =>
     console.log(`  ${range.padEnd(18)} ${desc}`),
@@ -314,4 +361,6 @@ function main(): void {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }
 
-main();
+if (require.main === module) {
+  main();
+}

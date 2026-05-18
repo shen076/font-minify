@@ -8,6 +8,7 @@
 - 两种压缩模式：**完整简/繁体中文**（约 2.1 万字）和 **GB2312 精简**（真实码表中的 6763 个汉字）
 - 输出 WOFF2 格式（最优网页字体压缩比）
 - 自动生成对应的 `@font-face` CSS 文件
+- 可选 `--nomarks` 剔除标点符号
 - 输出文件统一写入 `font/` 目录
 
 ## 环境依赖
@@ -37,6 +38,10 @@ npx tsx compress-font.ts <字体文件.otf>
 
 # GB2312 精简模式（简体为主，真实码表中的 6763 个汉字，体积更小）
 npx tsx compress-font.ts <字体文件.otf> --gb2312
+
+# 剔除标点符号
+npx tsx compress-font.ts <字体文件.otf> --nomarks
+npx tsx compress-font.ts <字体文件.otf> --gb2312 --nomarks
 ```
 
 ### 示例
@@ -44,6 +49,8 @@ npx tsx compress-font.ts <字体文件.otf> --gb2312
 ```bash
 npx tsx compress-font.ts font/汇文明朝体.OTF
 npx tsx compress-font.ts font/汇文明朝体.OTF --gb2312
+npx tsx compress-font.ts font/汇文明朝体.OTF --nomarks
+npx tsx compress-font.ts font/汇文明朝体.OTF --gb2312 --nomarks
 ```
 
 输出文件写入 `font/` 目录：
@@ -53,8 +60,12 @@ font/
 ├── 汇文明朝体.OTF              # 原始字体（不纳入版本控制）
 ├── 汇文明朝体-subset.woff2     # 完整模式输出
 ├── 汇文明朝体-subset.css
-├── 汇文明朝体-gb2312-subset.woff2  # GB2312 模式输出
-└── 汇文明朝体-gb2312-subset.css
+├── 汇文明朝体-gb2312-subset.woff2          # GB2312 模式输出
+├── 汇文明朝体-gb2312-subset.css
+├── 汇文明朝体-nomarks-subset.woff2         # 剔除标点输出
+├── 汇文明朝体-nomarks-subset.css
+├── 汇文明朝体-gb2312-nomarks-subset.woff2  # GB2312 + 剔除标点输出
+└── 汇文明朝体-gb2312-nomarks-subset.css
 ```
 
 ## 引入 CSS
@@ -105,6 +116,18 @@ font/
 | GB2312 汉字表 | 真实双字节码表生成的 6763 个汉字 |
 | U+FE30–FE4F   | CJK 兼容形式                     |
 | U+FF00–FFEF   | 全角/半角形式                    |
+
+### `--nomarks`
+
+添加 `--nomarks` 后会剔除标点相关区间，并将 ASCII / 全角范围收窄为数字、英文字母和空格：
+
+| 区间                                  | 说明                     |
+| ------------------------------------- | ------------------------ |
+| U+0020                                | 空格                     |
+| U+0030–0039 / U+0041–005A / U+0061–007A | ASCII 数字和英文字母     |
+| U+00C0–00D6 / U+00D8–00F6 / U+00F8–00FF | Latin-1 字母             |
+| U+FF10–FF19 / U+FF21–FF3A / U+FF41–FF5A | 全角数字和英文字母       |
+| 中文相关区间或 GB2312 汉字表          | 按当前压缩模式继续保留   |
 
 ## License
 

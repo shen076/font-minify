@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "compress": "tsx compress-font.ts"
+    "compress": "tsx compress-font.ts",
+    "test": "node --import tsx --test compress-font.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.19.39",
