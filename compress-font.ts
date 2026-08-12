@@ -1,11 +1,14 @@
 /**
  * compress-font.ts
  *
- * 将 OTF/TTF 压缩为 WOFF2 子集，保留常用简/繁体中文 + ASCII + 标点符号。
+ * 将 OTF/TTF 压缩为 WOFF2 子集，保留常用简/繁体中文 + ASCII + 标点符号，
+ * 不包含康熙部首、注音符号、兼容汉字等容易显得「乱码」的区间。
+ * 默认汉字集为运行时真实码表生成：
+ * GB2312（常用简体 6,763 字）∪ Big5 常用区（常用繁体 5,401 字）。
  * 底层依赖 Python fonttools（首次运行时会尝试自动安装）。
  *
  * 用法:
- *   npx tsx compress-font.ts <字体文件>                    # 完整简/繁体中文模式
+ *   npx tsx compress-font.ts <字体文件>                    # 常用简/繁体汉字模式（GB2312 ∪ Big5 常用区，无乱码区间）
  *   npx tsx compress-font.ts <字体文件> --gb2312            # 仅 GB2312 字符范围（简体为主）
  *   npx tsx compress-font.ts <字体文件> --nomarks           # 剔除标点符号
  *   npx tsx compress-font.ts <字体文件> --gb2312 --nomarks  # GB2312 + 剔除标点符号
@@ -20,8 +23,9 @@ import path from "path";
 // ---------------------------------------------------------------------------
 
 /**
- * 完整模式：覆盖绝大多数简体 + 繁体中文 + ASCII + 各类标点。
- * CJK 统一汉字主区 U+4E00-9FFF 含 ~20,902 个字，简/繁体绝大多数字均在其中。
+ * 默认常用模式：只保留网页正文需要的 ASCII、Latin-1 和标点区间。
+ * 汉字不整体保留 U+4E00-9FFF 主区（会混入大量生僻字），
+ * 而是由 GB2312 ∪ Big5 真实码表运行时生成（见 getCommonHanzi）。
  */
 type UnicodeDisplayRange = [string, string];
 
@@ -30,24 +34,15 @@ type UnicodeSubset = {
   displayRanges: UnicodeDisplayRange[];
 };
 
-const RANGES_FULL: UnicodeDisplayRange[] = [
+const RANGES_COMMON_BASE: UnicodeDisplayRange[] = [
   ["U+0020-007E", "ASCII 可打印字符"],
   ["U+00A0-00FF", "Latin-1 补充（带音调拉丁字母等）"],
   ["U+2000-206F", "通用标点（引号、破折号等）"],
-  ["U+2E80-2EFF", "CJK 部首补充"],
-  ["U+2F00-2FDF", "康熙部首"],
   ["U+3000-303F", "CJK 符号和标点（全角句号、书名号等）"],
-  ["U+3100-312F", "注音符号（繁体拼音）"],
-  ["U+31A0-31BF", "注音符号扩展"],
-  ["U+4E00-9FFF", "CJK 统一汉字主区（简/繁体均覆盖）"],
-  ["U+F900-FAFF", "CJK 兼容汉字"],
-  ["U+FE10-FE1F", "竖排变体标点"],
-  ["U+FE30-FE4F", "CJK 兼容形式"],
-  ["U+FE50-FE6F", "小形式变体"],
-  ["U+FF00-FFEF", "全角/半角形式"],
+  ["U+FF00-FFEF", "全角/半角形式（全角标点等）"],
 ];
 
-const RANGES_FULL_NOMARKS: UnicodeDisplayRange[] = [
+const RANGES_COMMON_NOMARKS_BASE: UnicodeDisplayRange[] = [
   ["U+0020", "空格"],
   ["U+0030-0039", "ASCII 数字"],
   ["U+0041-005A", "ASCII 大写字母"],
@@ -55,12 +50,6 @@ const RANGES_FULL_NOMARKS: UnicodeDisplayRange[] = [
   ["U+00C0-00D6", "Latin-1 字母"],
   ["U+00D8-00F6", "Latin-1 字母"],
   ["U+00F8-00FF", "Latin-1 字母"],
-  ["U+2E80-2EFF", "CJK 部首补充"],
-  ["U+2F00-2FDF", "康熙部首"],
-  ["U+3100-312F", "注音符号（繁体拼音）"],
-  ["U+31A0-31BF", "注音符号扩展"],
-  ["U+4E00-9FFF", "CJK 统一汉字主区（简/繁体均覆盖）"],
-  ["U+F900-FAFF", "CJK 兼容汉字"],
   ["U+FF10-FF19", "全角数字"],
   ["U+FF21-FF3A", "全角大写字母"],
   ["U+FF41-FF5A", "全角小写字母"],
@@ -92,7 +81,17 @@ const RANGES_GB2312_NOMARKS_BASE: UnicodeDisplayRange[] = [
   ["U+FF41-FF5A", "全角小写字母"],
 ];
 
+type CommonHanzi = {
+  specs: string[];
+  totalCount: number;
+  gb2312Count: number;
+  big5Count: number;
+};
+
+let gb2312CodePointsCache: Set<number> | null = null;
+let big5CodePointsCache: Set<number> | null = null;
 let gb2312HanziSpecsCache: string[] | null = null;
+let commonHanziCache: CommonHanzi | null = null;
 
 // ---------------------------------------------------------------------------
 // 工具函数
@@ -111,20 +110,25 @@ function formatUnicodeRange(start: number, end: number): string {
   return `U+${fmtCodePoint(start)}-${fmtCodePoint(end)}`;
 }
 
-function getGb2312HanziSpecs(): string[] {
-  if (gb2312HanziSpecsCache) {
-    return gb2312HanziSpecsCache;
-  }
-
-  let decoder: TextDecoder;
+function createFatalDecoder(encoding: string): TextDecoder {
   try {
-    decoder = new TextDecoder("gbk", { fatal: true });
+    return new TextDecoder(encoding, { fatal: true });
   } catch {
     throw new Error(
-      "当前 Node.js 环境不支持 gbk 解码，无法生成真实 GB2312 子集。请使用官方 Node.js 18+ 版本。",
+      `当前 Node.js 环境不支持 ${encoding} 解码，无法生成真实汉字码表。请使用官方 Node.js 18+ 版本。`,
     );
   }
+}
 
+/**
+ * 收集 GB2312 真实双字节码表中的 CJK 主区汉字（6,763 字，常用简体）。
+ */
+function collectGb2312CodePoints(): Set<number> {
+  if (gb2312CodePointsCache) {
+    return gb2312CodePointsCache;
+  }
+
+  const decoder = createFatalDecoder("gbk");
   const codePoints = new Set<number>();
 
   for (let highByte = 0xa1; highByte <= 0xf7; highByte++) {
@@ -142,12 +146,64 @@ function getGb2312HanziSpecs(): string[] {
     }
   }
 
-  const sortedCodePoints = [...codePoints].sort((left, right) => left - right);
-  if (sortedCodePoints.length !== 6763) {
+  if (codePoints.size !== 6763) {
     throw new Error(
-      `生成的 GB2312 汉字数量异常: ${sortedCodePoints.length}，预期 6763。`,
+      `生成的 GB2312 汉字数量异常: ${codePoints.size}，预期 6763。`,
     );
   }
+
+  gb2312CodePointsCache = codePoints;
+  return codePoints;
+}
+
+/**
+ * 收集 Big5 常用区（0xA440-0xC67E，5,401 字）中的 CJK 主区汉字（常用繁体）。
+ * 不收集次常用区（0xC940-0xF9D5，含龘等生僻字）、符号区（0xA1-0xA3）
+ * 与造字区（0xC6A1-0xC8FE），映射到主区之外的字自然被排除。
+ */
+function collectBig5CodePoints(): Set<number> {
+  if (big5CodePointsCache) {
+    return big5CodePointsCache;
+  }
+
+  const decoder = createFatalDecoder("big5");
+  const codePoints = new Set<number>();
+
+  // Big5 常用区：0xA440-0xC67E（首行 0xA4 从 0x40 起，末行 0xC6 到 0x7E 止）
+  for (let highByte = 0xa4; highByte <= 0xc6; highByte++) {
+    for (let lowByte = 0x40; lowByte <= 0xfe; lowByte++) {
+      if (lowByte > 0x7e && lowByte < 0xa1) continue;
+      if (highByte === 0xc6 && lowByte > 0x7e) continue;
+
+      try {
+        const char = decoder.decode(Uint8Array.from([highByte, lowByte]));
+        const codePoint = char.codePointAt(0);
+
+        if (codePoint && codePoint >= 0x4e00 && codePoint <= 0x9fff) {
+          codePoints.add(codePoint);
+        }
+      } catch {
+        // 无效字节对直接跳过。
+      }
+    }
+  }
+
+  // Big5 常用区汉字标准为 5,401 字，严格校验。
+  if (codePoints.size !== 5401) {
+    throw new Error(
+      `生成的 Big5 常用汉字数量异常: ${codePoints.size}，预期 5401。`,
+    );
+  }
+
+  big5CodePointsCache = codePoints;
+  return codePoints;
+}
+
+/**
+ * 将码点集合压缩为 U+XXXX-YYYY 形式的 Unicode 区间（供 pyftsubset --unicodes 使用）。
+ */
+function compressCodePointsToSpecs(codePoints: Set<number>): string[] {
+  const sortedCodePoints = [...codePoints].sort((left, right) => left - right);
 
   const specs: string[] = [];
   let start = sortedCodePoints[0];
@@ -166,9 +222,38 @@ function getGb2312HanziSpecs(): string[] {
   }
 
   specs.push(formatUnicodeRange(start, prev));
-  gb2312HanziSpecsCache = specs;
-
   return specs;
+}
+
+function getGb2312HanziSpecs(): string[] {
+  if (!gb2312HanziSpecsCache) {
+    gb2312HanziSpecsCache = compressCodePointsToSpecs(
+      collectGb2312CodePoints(),
+    );
+  }
+  return gb2312HanziSpecsCache;
+}
+
+/**
+ * 默认模式的汉字集：GB2312（常用简体）∪ Big5 常用区（常用繁体）。
+ */
+function getCommonHanzi(): CommonHanzi {
+  if (!commonHanziCache) {
+    const gb2312CodePoints = collectGb2312CodePoints();
+    const big5CodePoints = collectBig5CodePoints();
+    const unionCodePoints = new Set<number>([
+      ...gb2312CodePoints,
+      ...big5CodePoints,
+    ]);
+
+    commonHanziCache = {
+      specs: compressCodePointsToSpecs(unionCodePoints),
+      totalCount: unionCodePoints.size,
+      gb2312Count: gb2312CodePoints.size,
+      big5Count: big5CodePoints.size,
+    };
+  }
+  return commonHanziCache;
 }
 
 export function getUnicodeSubset(
@@ -176,11 +261,20 @@ export function getUnicodeSubset(
   noMarksMode: boolean,
 ): UnicodeSubset {
   if (!gb2312Mode) {
-    const ranges = noMarksMode ? RANGES_FULL_NOMARKS : RANGES_FULL;
+    const commonHanzi = getCommonHanzi();
+    const baseRanges = noMarksMode
+      ? RANGES_COMMON_NOMARKS_BASE
+      : RANGES_COMMON_BASE;
 
     return {
-      unicodes: ranges.map(([range]) => range),
-      displayRanges: ranges,
+      unicodes: [...baseRanges.map(([range]) => range), ...commonHanzi.specs],
+      displayRanges: [
+        ...baseRanges,
+        [
+          "常用简/繁汉字表",
+          `GB2312 (${commonHanzi.gb2312Count.toLocaleString("en-US")} 字) ∪ Big5 常用区 (${commonHanzi.big5Count.toLocaleString("en-US")} 字)，去重后 ${commonHanzi.totalCount.toLocaleString("en-US")} 字，${commonHanzi.specs.length} 段`,
+        ],
+      ],
     };
   }
 
@@ -190,10 +284,7 @@ export function getUnicodeSubset(
     : RANGES_GB2312_BASE;
 
   return {
-    unicodes: [
-      ...baseRanges.map(([range]) => range),
-      ...gb2312HanziSpecs,
-    ],
+    unicodes: [...baseRanges.map(([range]) => range), ...gb2312HanziSpecs],
     displayRanges: [
       ...baseRanges,
       [
@@ -300,7 +391,8 @@ function main(): void {
   if (!inputFile) {
     console.error(
       "用法: npx tsx compress-font.ts <字体文件.otf> [--gb2312] [--nomarks]\n" +
-        "  --gb2312   使用 GB2312 字符范围（简体为主，不含部分扩展繁体字）\n" +
+        "  默认模式保留 GB2312 ∪ Big5 常用区的常用简/繁汉字 + ASCII + 标点，不含乱码区间\n" +
+        "  --gb2312   仅使用 GB2312 字符范围（简体为主，体积更小）\n" +
         "  --nomarks  剔除标点符号",
     );
     process.exit(1);
@@ -330,7 +422,7 @@ function main(): void {
   console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`输入文件 : ${path.basename(inputPath)}  (${fmt(originalSize)})`);
   console.log(
-    `压缩模式 : ${gb2312Mode ? "GB2312 精简（简体为主）" : "完整简/繁体中文"}`,
+    `压缩模式 : ${gb2312Mode ? "GB2312 精简（简体为主）" : "常用简/繁汉字（GB2312 ∪ Big5 常用区）"}`,
   );
   console.log(`剔除标点 : ${noMarksMode ? "是" : "否"}`);
   console.log("Unicode 区间:");
@@ -352,12 +444,12 @@ function main(): void {
     `大小     : ${fmt(originalSize)}  →  ${fmt(outputSize)}  (缩减 ${reduction}%)`,
   );
 
-  writeCss(base, path.basename(outputPath), dir, suffix);
-  const cssHref = path.posix.join("font", `${base}${suffix}.css`);
+  // writeCss(base, path.basename(outputPath), dir, suffix);
+  // const cssHref = path.posix.join("font", `${base}${suffix}.css`);
 
-  console.log(
-    `\n在 HTML <head> 中引用：\n  <link rel="stylesheet" href="${cssHref}">`,
-  );
+  // console.log(
+  //   `\n在 HTML <head> 中引用：\n  <link rel="stylesheet" href="${cssHref}">`,
+  // );
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 }
 
